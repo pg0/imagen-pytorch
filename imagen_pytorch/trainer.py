@@ -15,8 +15,14 @@ from torch.cuda.amp import autocast, GradScaler
 import pytorch_warmup as warmup
 
 from imagen_pytorch.imagen_pytorch import Imagen
+from imagen_pytorch.elucidated_imagen import ElucidatedImagen
+
+from imagen_pytorch.version import __version__
+from packaging import version
 
 import numpy as np
+
+from ema_pytorch import EMA
 
 # helper functions
 
@@ -63,10 +69,6 @@ def num_to_groups(num, divisor):
     if remainder > 0:
         arr.append(remainder)
     return arr
-
-def get_pkg_version():
-    from pkg_resources import get_distribution
-    return get_distribution('dalle2_pytorch').version
 
 # decorators
 
@@ -141,67 +143,6 @@ def split_args_and_kwargs(*args, split_size = None, **kwargs):
         chunk_size_frac = chunk_size / batch_size
         yield chunk_size_frac, (chunked_args, chunked_kwargs)
 
-# exponential moving average wrapper
-
-class EMA(nn.Module):
-    def __init__(
-        self,
-        model,
-        beta = 0.9999,
-        update_after_step = 1000,
-        update_every = 10,
-    ):
-        super().__init__()
-        self.beta = beta
-        self.online_model = model
-        self.ema_model = copy.deepcopy(model)
-
-        self.update_every = update_every
-        self.update_after_step = update_after_step  // update_every # only start EMA after this step number, starting at 0
-
-        self.register_buffer('initted', torch.Tensor([False]))
-        self.register_buffer('step', torch.tensor([0]))
-
-    def restore_ema_model_device(self):
-        device = self.initted.device
-        self.ema_model.to(device)
-
-    def copy_params_from_model_to_ema(self):
-        self.ema_model.state_dict(self.online_model.state_dict())
-
-    def update(self):
-        self.step += 1
-
-        if (self.step % self.update_every) != 0:
-            return
-
-        if self.step <= self.update_after_step:
-            self.copy_params_from_model_to_ema()
-            return
-
-        if not self.initted:
-            self.copy_params_from_model_to_ema()
-            self.initted.data.copy_(torch.Tensor([True]))
-
-        self.update_moving_average(self.ema_model, self.online_model)
-
-    def update_moving_average(self, ma_model, current_model):
-        def calculate_ema(beta, old, new):
-            if not exists(old):
-                return new
-            return old * beta + (1 - beta) * new
-
-        for current_params, ma_params in zip(current_model.parameters(), ma_model.parameters()):
-            old_weight, up_weight = ma_params.data, current_params.data
-            ma_params.data = calculate_ema(self.beta, old_weight, up_weight)
-
-        for current_buffer, ma_buffer in zip(current_model.buffers(), ma_model.buffers()):
-            new_buffer_value = calculate_ema(self.beta, ma_buffer, current_buffer)
-            ma_buffer.copy_(new_buffer_value)
-
-    def __call__(self, *args, **kwargs):
-        return self.ema_model(*args, **kwargs)
-
 # imagen trainer
 
 def imagen_sample_in_chunks(fn):
@@ -217,7 +158,11 @@ def imagen_sample_in_chunks(fn):
         else:
             outputs = [fn(self, *chunked_args, **chunked_kwargs) for _, (chunked_args, chunked_kwargs) in split_args_and_kwargs(*args, split_size = max_batch_size, **kwargs)]
 
-        return torch.cat(outputs, dim = 0)
+        if isinstance(outputs[0], torch.Tensor):
+            return torch.cat(outputs, dim = 0)
+
+        return list(map(lambda t: torch.cat(t, dim = 0), list(zip(*outputs))))
+
     return inner
 
 class ImagenTrainer(nn.Module):
@@ -227,7 +172,9 @@ class ImagenTrainer(nn.Module):
         use_ema = True,
         lr = 1e-4,
         eps = 1e-8,
-        max_grad_norm = 0.5,
+        beta1 = 0.9,
+        beta2 = 0.99,
+        max_grad_norm = None,
         amp = False,
         group_wd_params = True,
         warmup_steps = None,
@@ -235,7 +182,8 @@ class ImagenTrainer(nn.Module):
         **kwargs
     ):
         super().__init__()
-        assert isinstance(imagen, Imagen)
+
+        assert isinstance(imagen, (Imagen, ElucidatedImagen))
         ema_kwargs, kwargs = groupby_prefix_and_trim('ema_', kwargs)
 
         self.imagen = imagen
@@ -256,6 +204,7 @@ class ImagenTrainer(nn.Module):
                 unet.parameters(),
                 lr = unet_lr,
                 eps = unet_eps,
+                betas = (beta1, beta2),
                 **kwargs
             )
 
@@ -270,10 +219,10 @@ class ImagenTrainer(nn.Module):
             scheduler = warmup_scheduler = None
 
             if exists(unet_cosine_decay_max_steps):
-                scheduler = CosineAnnealingLR(optimizer, T_max = unet_warmup_steps)
+                scheduler = CosineAnnealingLR(optimizer, T_max = unet_cosine_decay_max_steps)
 
             if exists(unet_warmup_steps):
-                warmup.LinearWarmup(optimizer, warmup_period = unet_warmup_steps)
+                warmup_scheduler = warmup.LinearWarmup(optimizer, warmup_period = unet_warmup_steps)
 
             setattr(self, f'scheduler{ind}', scheduler)
             setattr(self, f'warmup{ind}', warmup_scheduler)
@@ -284,6 +233,10 @@ class ImagenTrainer(nn.Module):
 
         self.register_buffer('step', torch.tensor([0.]))
 
+        # automatic set device to imagen's device, if needed
+
+        self.to(next(imagen.parameters()).device)
+
     def save(self, path, overwrite = True, **kwargs):
         path = Path(path)
         assert not (path.exists() and not overwrite)
@@ -291,7 +244,7 @@ class ImagenTrainer(nn.Module):
 
         save_obj = dict(
             model = self.imagen.state_dict(),
-            version = get_pkg_version(),
+            version = __version__,
             step = self.step.item(),
             **kwargs
         )
@@ -326,8 +279,8 @@ class ImagenTrainer(nn.Module):
 
         loaded_obj = torch.load(str(path))
 
-        if get_pkg_version() != loaded_obj['version']:
-            print(f'loading saved imagen at version {loaded_obj["version"]}, but current package version is {get_pkg_version()}')
+        if version.parse(__version__) != loaded_obj['version']:
+            print(f'loading saved imagen at version {loaded_obj["version"]}, but current package version is {__version__}')
 
         self.imagen.load_state_dict(loaded_obj['model'], strict = strict)
         self.step.copy_(torch.ones_like(self.step) * loaded_obj['step'])
@@ -413,10 +366,11 @@ class ImagenTrainer(nn.Module):
         if kwargs.pop('use_non_ema', False) or not self.use_ema:
             return self.imagen.sample(*args, **kwargs)
 
+        device = self.step.device
         trainable_unets = self.imagen.unets
         self.imagen.unets = self.unets                  # swap in exponential moving averaged unets for sampling
 
-        output = self.imagen.sample(*args, **kwargs)
+        output = self.imagen.sample(*args, device = device, **kwargs)
 
         self.imagen.unets = trainable_unets             # restore original training unets
 

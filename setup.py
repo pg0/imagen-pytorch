@@ -1,9 +1,17 @@
 from setuptools import setup, find_packages
+exec(open('imagen_pytorch/version.py').read())
 
 setup(
   name = 'imagen-pytorch',
   packages = find_packages(exclude=[]),
-  version = '0.0.47',
+  include_package_data = True,
+  entry_points={
+    'console_scripts': [
+      'imagen_pytorch = imagen_pytorch.cli:main',
+      'imagen = imagen_pytorch.cli:imagen'
+    ],
+  },
+  version = __version__,
   license='MIT',
   description = 'Imagen - unprecedented photorealism × deep level of language understanding',
   author = 'Phil Wang',
@@ -21,9 +29,12 @@ setup(
     'click',
     'einops>=0.4',
     'einops-exts',
+    'ema-pytorch>=0.0.3',
     'numpy',
+    'packaging',
     'pillow',
     'pydantic',
+    'pytorch-lightning',
     'pytorch-warmup',
     'resize-right',
     'sentencepiece',
